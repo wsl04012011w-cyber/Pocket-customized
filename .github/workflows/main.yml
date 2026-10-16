@@ -1,0 +1,128 @@
+name: Build APK
+
+# Coloque este arquivo em .github/workflows/build-apk.yml
+# e deixe na raiz do repo UM único .zip com o projeto (ex.: pocketpal-ai-custom.zip).
+# O workflow descompacta o zip, compila e publica o APK.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '*.zip'
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      # Usa os binários pré-compilados do llama.rn (bem mais rápido que compilar do zero).
+      ORG_GRADLE_PROJECT_rnllamaBuildFromSource: 'false'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Descompactar o ZIP do repo
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          zips=(*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "::error::Nenhum .zip encontrado na raiz do repositório."
+            exit 1
+          fi
+          if [ ${#zips[@]} -gt 1 ]; then
+            echo "::warning::Mais de um .zip na raiz; usando o primeiro: ${zips[0]}"
+          fi
+          echo "Usando: ${zips[0]}"
+          mkdir -p _unzip
+          unzip -q "${zips[0]}" -d _unzip
+
+          # Localiza a pasta do projeto (a que tem package.json + android/)
+          root=""
+          while IFS= read -r pj; do
+            d=$(dirname "$pj")
+            if [ -d "$d/android" ]; then root="$d"; break; fi
+          done < <(find _unzip -maxdepth 3 -name package.json -not -path '*/node_modules/*' | sort)
+
+          if [ -z "$root" ]; then
+            echo "::error::Não achei package.json + android/ dentro do zip."
+            exit 1
+          fi
+          echo "Projeto em: $root"
+          mv "$root" project
+          chmod +x project/android/gradlew || true
+          chmod +x project/scripts/*.sh || true
+
+      - name: Liberar espaço em disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc
+          df -h /
+
+      - name: Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.21.0'
+          cache: 'yarn'
+          cache-dependency-path: project/yarn.lock
+
+      - name: Instalar dependências
+        working-directory: project
+        run: |
+          npm install -g yarn
+          yarn install
+
+      - name: JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: google-services.json de mentira (o app exige o arquivo)
+        working-directory: project
+        run: |
+          cat > android/app/google-services.json << 'EOL'
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "dummy-project",
+              "storage_bucket": "dummy-project.appspot.com"
+            },
+            "client": [{
+              "client_info": {
+                "mobilesdk_app_id": "1:000000000000:android:0000000000000000",
+                "android_client_info": { "package_name": "com.pocketpalai" }
+              },
+              "api_key": [{ "current_key": "dummy-api-key" }]
+            }]
+          }
+          EOL
+
+      - name: .env de mentira
+        working-directory: project
+        run: |
+          cat > .env << 'EOL'
+          FIREBASE_FUNCTIONS_URL=https://dummy-firebase-url.com
+          SUPABASE_URL=https://dummy-supabase-url.supabase.co
+          SUPABASE_ANON_KEY=dummy-anon-key
+          PALSHUB_API_BASE_URL=https://dummy-palshub-api.com
+          APP_URL=pocketpal://app
+          ENABLE_PALSHUB_INTEGRATION=false
+          ENABLE_AUTHENTICATION=false
+          ENABLE_OFFLINE_MODE=true
+          GOOGLE_IOS_CLIENT_ID=dummy-ios-client-id.apps.googleusercontent.com
+          GOOGLE_WEB_CLIENT_ID=dummy-web-client-id.apps.googleusercontent.com
+          EOL
+
+      # Sem keystore de release, o build cai para a chave debug,
+      # então o APK sai instalável direto no celular.
+      - name: Build do APK (arm64)
+        working-directory: project/android
+        run: ./gradlew assembleProdRelease -PreactNativeArchitectures=arm64-v8a --no-daemon
+
+      - name: Enviar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: pocketpal-custom-apk
+          path: project/android/app/build/outputs/apk/prod/release/*.apk
+          if-no-files-found: error
